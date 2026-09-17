@@ -41,7 +41,8 @@ store.transition(attempt.id, "succeeded", exit_code=0)
 `prepare_job` / `attach_artifact` / `execute` / `status` / `cancel` /
 `read_result` / `quarantine_job`, plus `mark_preparing`, `mark_ready`,
 `record_result`, `fail_job`, `confirm_cancelled`, `mark_unknown_outcome`,
-`retry_job`, and `recover`.
+`retry_job`, and `recover`. Read helpers `status`, `get_job`, and
+`attachments` never mutate state.
 
 Durable machine:
 
