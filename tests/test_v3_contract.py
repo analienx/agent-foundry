@@ -7,6 +7,7 @@ import pytest
 from agent_foundry import (
     ArtifactValidationError,
     ArtifactVerificationError,
+    ArtifactVerifier,
     AttemptConflict,
     IllegalTransitionError,
     JobNotReadyError,
@@ -17,6 +18,31 @@ from agent_foundry import (
 
 SOURCE = "a" * 40
 LOCK = "b" * 64
+POLICY = {
+    "source_repo": "example/synthetic",
+    "lock_digest": LOCK,
+    "platform": "linux",
+    "arch": "x86_64",
+    "toolchain": "node-22",
+    "lifecycle_policy": "no-scripts",
+    "provenance_ref": "synthetic-provenance",
+}
+
+
+class FakeVerifier(ArtifactVerifier):
+    """Deployment stand-in: accepts the payload and mounts it read-only."""
+
+    def __init__(self):
+        self.verify_calls = 0
+        self.mount_calls = []
+
+    def verify(self, manifest):
+        self.verify_calls += 1
+        return True
+
+    def mount_readonly(self, *, job_id, manifest):
+        self.mount_calls.append((job_id, manifest.payload_digest))
+        return f"/mnt/ro/{manifest.payload_digest[:12]}"
 
 
 def make_manifest(**overrides):
@@ -45,8 +71,15 @@ def make_manifest(**overrides):
 
 def make_job(store, key="prep-1"):
     job, _ = store.prepare_job(project="synthetic", ref="main",
-                                source_digest=SOURCE, idempotency_key=key)
+                                source_digest=SOURCE, idempotency_key=key,
+                                artifact_policy=POLICY)
     return job
+
+
+def attach_ok(store, job, manifest, payload, key, **overrides):
+    return store.attach_artifact(job_id=job.id, manifest=manifest, expected_generation=job.generation,
+                                 idempotency_key=key, payload=payload,
+                                 verifier=overrides.pop("verifier", FakeVerifier()), **overrides)
 
 
 def drive_ready(store, job):
@@ -189,6 +222,7 @@ def test_artifact_attach_and_tamper_quarantines(tmp_path):
     manifest, payload = make_manifest()
     record, dup = store.attach_artifact(job_id=job.id, manifest=manifest, expected_generation=1,
                                         idempotency_key="art-1", payload=payload,
+                                        verifier=FakeVerifier(),
                                         require_lock_digest=LOCK, require_platform="linux")
     assert not dup and record.artifact_digest == manifest["payload_digest"]
     assert [a.artifact_digest for a in store.attachments(job.id)] == [manifest["payload_digest"]]
@@ -197,7 +231,8 @@ def test_artifact_attach_and_tamper_quarantines(tmp_path):
     manifest2, _ = make_manifest()
     with pytest.raises(ArtifactVerificationError):
         store.attach_artifact(job_id=job2.id, manifest=manifest2, expected_generation=1,
-                              idempotency_key="art-2", payload=b"tampered")
+                              idempotency_key="art-2", payload=b"tampered",
+                              verifier=FakeVerifier())
     assert store.get_job(job2.id).state == "quarantined"
 
 
@@ -216,7 +251,8 @@ def test_artifact_source_pin_mismatch_quarantines(tmp_path):
     manifest, payload = make_manifest(source_commit="c" * 40)
     with pytest.raises(ArtifactVerificationError):
         store.attach_artifact(job_id=job.id, manifest=manifest, expected_generation=1,
-                              idempotency_key="art-x", payload=payload)
+                              idempotency_key="art-x", payload=payload,
+                              verifier=FakeVerifier())
     assert store.get_job(job.id).state == "quarantined"
 
 
@@ -227,7 +263,7 @@ def test_read_result_terminal_only_and_reports_artifacts(tmp_path):
         store.read_result(job_id=job.id)
     manifest, payload = make_manifest()
     store.attach_artifact(job_id=job.id, manifest=manifest, expected_generation=1,
-                          idempotency_key="art-1", payload=payload)
+                          idempotency_key="art-1", payload=payload, verifier=FakeVerifier())
     job, _ = store.execute(job_id=job.id, command_profile="offline-test", objective="synthetic",
                            authority_ref="synthetic-policy", expected_generation=1,
                            idempotency_key="exec-1", native_identity="native-1")

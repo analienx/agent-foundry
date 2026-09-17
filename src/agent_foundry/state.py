@@ -14,7 +14,9 @@ Terminal states are immutable except for an explicit ``retry`` which opens a
 new generation linked to the prior attempt. ``interrupted`` means the job is
 known to have never started (no native identity was ever recorded).
 ``unknown_outcome`` means side effects are possible but unconfirmed; it is
-never blindly replayed.
+never blindly replayed. A ``ready`` job holding a durably reserved but
+unconfirmed launch likewise carries possible side effects, so ``ready`` may
+reconcile directly to ``unknown_outcome``.
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ NON_TERMINAL = frozenset({ACCEPTED, PREPARING, READY, RUNNING, CANCEL_REQUESTED}
 TRANSITIONS: dict[str, frozenset[str]] = {
     ACCEPTED: frozenset({PREPARING, FAILED, INTERRUPTED}),
     PREPARING: frozenset({READY, FAILED, CANCEL_REQUESTED, INTERRUPTED}),
-    READY: frozenset({RUNNING, FAILED, CANCEL_REQUESTED, INTERRUPTED}),
+    READY: frozenset({RUNNING, FAILED, CANCEL_REQUESTED, INTERRUPTED, UNKNOWN_OUTCOME}),
     RUNNING: frozenset({SUCCEEDED, FAILED, CANCEL_REQUESTED, UNKNOWN_OUTCOME}),
     CANCEL_REQUESTED: frozenset({CANCELLED, UNKNOWN_OUTCOME, FAILED}),
     SUCCEEDED: frozenset(),
