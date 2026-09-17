@@ -589,7 +589,13 @@ class JobStore:
                     raise error
 
                 try:
-                    parsed = validate_manifest(raw_manifest)
+                    parsed = validate_manifest(
+                        raw_manifest,
+                        allowed_binaries=(verifier.allowed_verifier_binaries
+                                          if verifier is not None else None),
+                        allowed_profiles=(verifier.allowed_verification_profiles
+                                          if verifier is not None else None),
+                    )
                 except Exception as error:  # noqa: BLE001 - must quarantine on any failure
                     quarantine_and_raise(error)
                     raise AssertionError("unreachable")

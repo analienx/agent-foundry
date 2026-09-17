@@ -454,6 +454,22 @@ def test_named_profiles_and_structured_argv_accepted(tmp_path):
     assert validate_manifest(base)
 
 
+def test_attach_honors_deployment_verifier_narrowing(tmp_path):
+    class DigestOnlyVerifier(FakeVerifier):
+        allowed_verifier_binaries = frozenset()
+        allowed_verification_profiles = frozenset({"digest-check"})
+
+    store = JobStore(tmp_path / "f.sqlite")
+    job = drive_ready(store, make_job(store))
+    manifest, payload = make_manifest(verify_commands=["sha256-check"])
+    with pytest.raises(ArtifactValidationError):
+        store.attach_artifact(
+            job_id=job.id, manifest=manifest, expected_generation=job.generation,
+            idempotency_key="narrowed-verifier", payload=payload,
+            verifier=DigestOnlyVerifier(),
+        )
+
+
 @pytest.mark.parametrize("commands", [
     ["curl https://example.invalid/check"],
     [["curl", "--check", "x"]],
