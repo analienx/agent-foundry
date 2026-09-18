@@ -148,6 +148,12 @@ POLICY_FIELDS = (
     "provenance_ref",
 )
 
+# Optional boolean switches a job-bound artifact policy may declare. They do
+# not map to manifest fields: they change how an attachment must be proven.
+# ``require_attachment_receipt`` demands a verified Agent Interop receipt (see
+# :mod:`agent_foundry.attachment`) before the attachment is recorded.
+POLICY_BOOL_FIELDS = ("require_attachment_receipt",)
+
 
 def _validate_verify_step(step: object, *, allowed_binaries: frozenset[str],
                           allowed_profiles: frozenset[str]) -> list[str] | None:
@@ -289,7 +295,9 @@ def validate_artifact_policy(policy: dict) -> dict:
 
     Required keys: ``source_repo``, ``lock_digest``, ``platform``, ``arch``,
     ``toolchain``, ``lifecycle_policy``. ``provenance_ref`` is optional but,
-    when declared, is enforced. Returns a normalized copy.
+    when declared, is enforced. ``require_attachment_receipt`` is an optional
+    boolean switch that demands an authenticated attachment receipt. Returns a
+    normalized copy.
     """
     if not isinstance(policy, dict):
         raise ValueError("artifact_policy must be a mapping")
@@ -313,7 +321,15 @@ def validate_artifact_policy(policy: dict) -> dict:
         errors.append(f"artifact_policy[lifecycle_policy] must be one of {sorted(LIFECYCLE_POLICIES)}")
     else:
         normalized["lifecycle_policy"] = lifecycle
-    unknown = sorted(k for k in policy if k not in set(POLICY_FIELDS))
+    for name in POLICY_BOOL_FIELDS:
+        if name not in policy:
+            continue
+        value = policy[name]
+        if not isinstance(value, bool):
+            errors.append(f"artifact_policy[{name}] must be a boolean")
+        else:
+            normalized[name] = value
+    unknown = sorted(k for k in policy if k not in set(POLICY_FIELDS) | set(POLICY_BOOL_FIELDS))
     if unknown:
         errors.append(f"artifact_policy has unknown fields: {unknown}")
     if errors:
