@@ -44,14 +44,21 @@ from typing import Any, Callable
 
 from .adapters import ArtifactVerifier, NativeLiveness
 from .artifacts import (
-    POLICY_FIELDS,
-    ArtifactManifest,
     ArtifactValidationError,
     ArtifactVerificationError,
     check_matches_policy,
     validate_artifact_policy,
     validate_manifest,
     verify_payload_bytes,
+)
+from .attachment import (
+    ArtifactAttachmentRequest,
+    AttachmentReceipt,
+    AttachmentReceiptError,
+    AttachmentReceiptVerifier,
+    AttachmentReplayError,
+    AttachmentRequestError,
+    verify_attachment_receipt,
 )
 from .attempts import AttemptConflict, canonical_hash
 from .state import (
@@ -60,7 +67,6 @@ from .state import (
     NON_TERMINAL,
     TERMINAL,
     can_transition,
-    is_terminal,
 )
 
 
@@ -85,11 +91,42 @@ class _ResumeLaunch(Exception):
 #: reject attachment so execution evidence always binds the frozen set.
 ATTACHABLE_STATES = frozenset({ACCEPTED, "preparing", "ready"})
 
+
+class _SqlReplayGuard:
+    """Durable single-use receipt guard running inside the attach transaction.
+
+    Consumption is committed together with the attachment row (or with the
+    durable failure response for a quarantined attachment), so a receipt is
+    consumed by the *attempt* that presented it and never by an outcome: a
+    failed or rejected attachment still burns the receipt and a fresh receipt
+    is required for a new attempt or generation. That is the fail-closed
+    direction -- byte-identical receipt reuse can never succeed.
+    """
+
+    def __init__(self, db: sqlite3.Connection):
+        self._db = db
+
+    def reserve(self, replay_key: str, *, job_id: str, generation: int,
+                replay_domain: str, receipt_digest: str) -> None:
+        row = self._db.execute(
+            "SELECT * FROM receipt_replays WHERE replay_key=?", (replay_key,)).fetchone()
+        if row is not None:
+            raise AttachmentReplayError(
+                f"attachment receipt {row['receipt_digest'][:12]} already authorized an "
+                f"attachment for job {row['job_id']!r} generation {row['generation']}")
+        self._db.execute(
+            "INSERT INTO receipt_replays (replay_key, job_id, generation, replay_domain,"
+            " receipt_digest, reserved_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (replay_key, job_id, int(generation), replay_domain, receipt_digest, _utcnow()))
+
 _ERROR_TYPES: dict[str, type[Exception]] = {
     "StaleGenerationError": StaleGenerationError,
     "IllegalTransitionError": IllegalTransitionError,
     "ArtifactValidationError": ArtifactValidationError,
     "ArtifactVerificationError": ArtifactVerificationError,
+    "AttachmentRequestError": AttachmentRequestError,
+    "AttachmentReceiptError": AttachmentReceiptError,
+    "AttachmentReplayError": AttachmentReplayError,
     "AttemptConflict": AttemptConflict,
     "ValueError": ValueError,
 }
@@ -148,6 +185,9 @@ class AttachmentRecord:
     attached_at: str
     generation: int = 1
     mount_point: str = ""
+    receipt_digest: str = ""
+    replay_domain: str = ""
+    evidence: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -182,7 +222,12 @@ CREATE TABLE IF NOT EXISTS attachments (
     job_id TEXT NOT NULL, artifact_digest TEXT NOT NULL,
     manifest_json TEXT NOT NULL, actor TEXT NOT NULL, attached_at TEXT NOT NULL,
     generation INTEGER NOT NULL DEFAULT 1, mount_point TEXT NOT NULL DEFAULT '',
+    receipt_digest TEXT NOT NULL DEFAULT '', replay_domain TEXT NOT NULL DEFAULT '',
+    receipt_evidence_json TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (job_id, artifact_digest));
+CREATE TABLE IF NOT EXISTS receipt_replays (
+    replay_key TEXT PRIMARY KEY, job_id TEXT NOT NULL, generation INTEGER NOT NULL,
+    replay_domain TEXT NOT NULL, receipt_digest TEXT NOT NULL, reserved_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS idempotency (
     scope TEXT NOT NULL, key TEXT NOT NULL, request_hash TEXT NOT NULL,
     response_json TEXT NOT NULL, PRIMARY KEY (scope, key));
@@ -219,6 +264,9 @@ class JobStore:
         for name, ddl in (
             ("generation", "INTEGER NOT NULL DEFAULT 1"),
             ("mount_point", "TEXT NOT NULL DEFAULT ''"),
+            ("receipt_digest", "TEXT NOT NULL DEFAULT ''"),
+            ("replay_domain", "TEXT NOT NULL DEFAULT ''"),
+            ("receipt_evidence_json", "TEXT NOT NULL DEFAULT ''"),
         ):
             if name not in attach_cols:
                 db.execute(f"ALTER TABLE attachments ADD COLUMN {name} {ddl}")
@@ -484,6 +532,9 @@ class JobStore:
         require_toolchain: str | None = None, require_lifecycle_policy: str | None = None,
         require_provenance_ref: str | None = None,
         payload: bytes | None = None, verifier: ArtifactVerifier | None = None,
+        attachment_request: ArtifactAttachmentRequest | dict | None = None,
+        attachment_receipt: AttachmentReceipt | dict | None = None,
+        receipt_verifier: AttachmentReceiptVerifier | None = None,
     ) -> tuple[AttachmentRecord, bool]:
         """Verify a payload and record an immutable attachment.
 
@@ -502,6 +553,15 @@ class JobStore:
         ``running``, ``cancel_requested``, and terminal states reject the
         call. A failed call stores its durable failure under the idempotency
         key so replays raise the same error instead of ``KeyError``.
+
+        When the job's artifact policy sets ``require_attachment_receipt`` (or
+        when any receipt argument is supplied), an Agent Interop authenticated
+        receipt must be presented and verified before the attachment is
+        recorded: the request is bound to the manifest, job, and current
+        attempt, the receipt is authenticated by the deployment
+        ``receipt_verifier``, its plan/step evidence is checked against the
+        manifest verification plan, and the receipt is durably consumed so a
+        byte-identical reply can never authorize a second attachment.
         """
         raw_manifest = dict(manifest)
         caller_constraints = {
@@ -519,7 +579,11 @@ class JobStore:
             {"op": "attach_artifact", "job_id": job_id, "manifest": raw_manifest,
              "generation": expected_generation, "constraints": caller_constraints,
              "has_payload": payload is not None,
-             "verifier": type(verifier).__name__ if verifier is not None else None}
+             "verifier": type(verifier).__name__ if verifier is not None else None,
+             "attachment_request": (attachment_request.request_hash
+                                    if isinstance(attachment_request, ArtifactAttachmentRequest)
+                                    else attachment_request),
+             "has_receipt": attachment_receipt is not None}
         )
         scope = f"job:{job_id}"
         with self._connect() as db:
@@ -544,12 +608,12 @@ class JobStore:
                             job_id, replay["artifact_digest"],
                             replay.get("manifest", {}), replay.get("actor", actor),
                             replay.get("attached_at", ""), replay.get("generation", 1),
-                            replay.get("mount_point", ""))
+                            replay.get("mount_point", ""),
+                            replay.get("receipt_digest", ""),
+                            replay.get("replay_domain", ""),
+                            replay.get("receipt_evidence"))
                         return record, True
-                    record = AttachmentRecord(
-                        job_id, row["artifact_digest"], json.loads(row["manifest_json"]),
-                        row["actor"], row["attached_at"], row["generation"],
-                        row["mount_point"])
+                    record = self._attachment(row)
                     return record, True
                 job = self._get_job(db, job_id)
 
@@ -612,6 +676,11 @@ class JobStore:
                     verify_payload_bytes(parsed, payload)
                     if not verifier.verify(parsed):
                         raise ArtifactVerificationError("deployment verifier rejected the payload")
+                    evidence = self._verify_attachment_receipt(
+                        db, job=job, manifest=parsed,
+                        attachment_request=attachment_request,
+                        attachment_receipt=attachment_receipt,
+                        receipt_verifier=receipt_verifier)
                     mount_point = verifier.mount_readonly(job_id=job.id, manifest=parsed)
                     if not isinstance(mount_point, str) or not mount_point.strip():
                         raise ArtifactVerificationError(
@@ -622,9 +691,13 @@ class JobStore:
                 now = _utcnow()
                 db.execute(
                     "INSERT OR IGNORE INTO attachments (job_id, artifact_digest, manifest_json, actor, attached_at,"
-                    " generation, mount_point) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    " generation, mount_point, receipt_digest, replay_domain, receipt_evidence_json)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (job_id, parsed.payload_digest, json.dumps(parsed.to_dict(), sort_keys=True),
-                     actor, now, job.generation, mount_point.strip()),
+                     actor, now, job.generation, mount_point.strip(),
+                     evidence.receipt_digest if evidence else "",
+                     evidence.replay_domain if evidence else "",
+                     json.dumps(evidence.to_dict(), sort_keys=True) if evidence else ""),
                 )
                 row = db.execute(
                     "SELECT * FROM attachments WHERE job_id=? AND artifact_digest=?",
@@ -633,16 +706,17 @@ class JobStore:
                              reason=f"artifact attached {parsed.payload_digest[:12]}",
                              artifact_digests=self._attached_digests(db, job_id))
                 assert row is not None
-                record = AttachmentRecord(job_id, row["artifact_digest"],
-                                          json.loads(row["manifest_json"]), row["actor"],
-                                          row["attached_at"], row["generation"], row["mount_point"])
+                record = self._attachment(row)
                 self._idem_store(db, scope=scope, key=idempotency_key,
                                  response={**self._job_response(job),
                                            "artifact_digest": record.artifact_digest,
                                            "manifest": record.manifest, "actor": record.actor,
                                            "attached_at": record.attached_at,
                                            "generation": record.generation,
-                                           "mount_point": record.mount_point})
+                                           "mount_point": record.mount_point,
+                                           "receipt_digest": record.receipt_digest,
+                                           "replay_domain": record.replay_domain,
+                                           "receipt_evidence": record.evidence})
                 db.execute("COMMIT")
                 return record, False
             except Exception:
@@ -651,6 +725,55 @@ class JobStore:
                 except Exception:
                     pass
                 raise
+
+    @staticmethod
+    def _attachment(row: sqlite3.Row) -> AttachmentRecord:
+        keys = row.keys()
+        evidence_json = row["receipt_evidence_json"] if "receipt_evidence_json" in keys else ""
+        return AttachmentRecord(
+            row["job_id"], row["artifact_digest"], json.loads(row["manifest_json"]),
+            row["actor"], row["attached_at"], row["generation"], row["mount_point"],
+            row["receipt_digest"] if "receipt_digest" in keys else "",
+            row["replay_domain"] if "replay_domain" in keys else "",
+            json.loads(evidence_json) if evidence_json else None)
+
+    @staticmethod
+    def _verify_attachment_receipt(
+        db: sqlite3.Connection, *, job: Job, manifest, attachment_request,
+        attachment_receipt, receipt_verifier,
+    ):
+        """Verify the Agent Interop receipt for an attachment, fail closed.
+
+        Returns the :class:`AttachmentReceiptEvidence` for durable recording
+        (or ``None`` when no receipt was required). When the job's artifact
+        policy demands a receipt, all three receipt arguments are mandatory;
+        supplying any of them always triggers verification so a caller can
+        never downgrade an authenticated attachment to an unauthenticated one.
+        """
+        required = bool(job.artifact_policy.get("require_attachment_receipt"))
+        supplied = (attachment_request is not None or attachment_receipt is not None
+                    or receipt_verifier is not None)
+        if not required and not supplied:
+            return None
+        if attachment_request is None or attachment_receipt is None or receipt_verifier is None:
+            raise ArtifactVerificationError(
+                "an authenticated Agent Interop attachment receipt is required: request, "
+                "receipt, and deployment receipt verifier must all be supplied")
+        request = (attachment_request if isinstance(attachment_request, ArtifactAttachmentRequest)
+                   else ArtifactAttachmentRequest.from_dict(attachment_request))
+        receipt = (attachment_receipt if isinstance(attachment_receipt, AttachmentReceipt)
+                   else AttachmentReceipt.from_dict(attachment_receipt))
+        expected = ArtifactAttachmentRequest.for_manifest(
+            manifest, submitting_identity=request.submitting_identity,
+            job_id=job.id, attempt_id=job.current_attempt_id,
+            generation=job.generation)
+        if request != expected:
+            raise ArtifactVerificationError(
+                "attachment request does not match the manifest, job, and current attempt")
+        return verify_attachment_receipt(
+            receipt, request, verifier=receipt_verifier,
+            verify_plan=manifest.verify_commands,
+            replay_guard=_SqlReplayGuard(db))
 
     @staticmethod
     def _launch_token(*, scope: str, key: str) -> str:
@@ -1234,9 +1357,7 @@ class JobStore:
     def attachments(self, job_id: str) -> list[AttachmentRecord]:
         with self._connect() as db:
             rows = db.execute("SELECT * FROM attachments WHERE job_id=? ORDER BY attached_at", (job_id,)).fetchall()
-            return [AttachmentRecord(job_id, row["artifact_digest"], json.loads(row["manifest_json"]),
-                                     row["actor"], row["attached_at"], row["generation"],
-                                     row["mount_point"]) for row in rows]
+            return [self._attachment(row) for row in rows]
 
     # -- recovery --------------------------------------------------------
 
